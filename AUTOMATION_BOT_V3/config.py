@@ -1,3 +1,7 @@
+"""
+config.py — V3.1 (Institutional Sniper Architecture)
+"""
+
 import os
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
@@ -26,16 +30,16 @@ class AIConfig:
 
 @dataclass
 class DynamicConfig:
-    # V3: Real-World Friction (Fees & Slippage)
+    # V3: Real-World Friction
     maker_fee_pct: float = 0.02
     taker_fee_pct: float = 0.05
     slippage_pct: float = 0.05
 
-    # V3: Dynamic Execution Window (Scholar can tune this)
+    # V3: Dynamic Execution Window
     execution_window_start: int = 57
     execution_window_end: int = 59
 
-    # Core Risk Parameters
+    # Strategy Parameters
     max_risk_per_trade_pct: float = 1.5
     max_open_positions: int = 2
     max_daily_loss_pct: float = 4.0
