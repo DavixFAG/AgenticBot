@@ -1,0 +1,10 @@
+venv/
+_pycache_/
+*.pyc
+data/
+logs/
+credentials/
+.env
+.git/
+tests/
+*.db
