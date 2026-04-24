@@ -1,12 +1,15 @@
 import json
 import logging
-import sqlite3
+import os
 import base64
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from typing import Dict, List, Optional
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from models import Trade, MonologueEntry, ScholarInsight
 
@@ -24,24 +27,29 @@ class CustomEncoder(json.JSONEncoder):
         return super().default(obj)
 
 class Database:
-    def __init__(self, db_path: str = "trading_bot.db"):
-        self.db_path = db_path
+    # We keep the db_path parameter so we don't break orchestrator.py, but we ignore it and use Postgres.
+    def __init__(self, db_path: str = None):
+        self.db_url = os.getenv("DATABASE_URL")
+        if not self.db_url:
+            log.warning("DATABASE_URL is missing. Make sure PostgreSQL is attached to your Railway app.")
         self._init_tables()
 
     @contextmanager
-    def _conn(self):
-        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
+    def _cursor(self):
+        conn = psycopg2.connect(self.db_url)
         try:
-            yield conn
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                yield cur
             conn.commit()
         finally:
             conn.close()
 
     def _init_tables(self):
-        with self._conn() as conn:
-            conn.executescript("""
+        if not self.db_url:
+            return
+            
+        with self._cursor() as cur:
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     id TEXT PRIMARY KEY, 
                     timestamp_open TEXT NOT NULL, 
@@ -61,14 +69,14 @@ class Database:
                     trailing_extreme_price REAL NOT NULL DEFAULT 0.0
                 );
                 CREATE TABLE IF NOT EXISTS monologue (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                    id SERIAL PRIMARY KEY, 
                     timestamp TEXT NOT NULL, 
                     agent TEXT NOT NULL, 
                     message TEXT NOT NULL, 
                     severity TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS scholar_reviews (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                    id SERIAL PRIMARY KEY, 
                     timestamp TEXT NOT NULL, 
                     period_start TEXT NOT NULL, 
                     period_end TEXT NOT NULL, 
@@ -81,7 +89,7 @@ class Database:
                     reasoning TEXT
                 );
                 CREATE TABLE IF NOT EXISTS pivot_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                    id SERIAL PRIMARY KEY, 
                     timestamp TEXT NOT NULL, 
                     old_bias TEXT NOT NULL, 
                     new_bias TEXT NOT NULL, 
@@ -91,7 +99,7 @@ class Database:
                     reasoning TEXT
                 );
                 CREATE TABLE IF NOT EXISTS dynamic_config_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                    id SERIAL PRIMARY KEY, 
                     timestamp TEXT NOT NULL, 
                     config_json TEXT NOT NULL, 
                     changed_by TEXT NOT NULL
@@ -106,24 +114,24 @@ class Database:
                 );
             """)
 
-    # ── V3 Safe JSON Multi-Process Memory Syncing ────────────
     def set_memory_state(self, key: str, obj):
         if obj is None:
             return
         try:
             json_str = json.dumps(obj, cls=CustomEncoder)
             b64 = base64.b64encode(json_str.encode('utf-8')).decode('ascii')
-            with self._conn() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO system_flags (key, value) VALUES (?, ?)", 
+            with self._cursor() as cur:
+                cur.execute(
+                    "INSERT INTO system_flags (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", 
                     (key, b64)
                 )
         except Exception as e:
             log.error(f"Failed to serialize state {key}: {e}")
 
     def get_memory_state(self, key: str):
-        with self._conn() as conn:
-            row = conn.execute("SELECT value FROM system_flags WHERE key = ?", (key,)).fetchone()
+        with self._cursor() as cur:
+            cur.execute("SELECT value FROM system_flags WHERE key = %s", (key,))
+            row = cur.fetchone()
             if row:
                 try:
                     decoded = base64.b64decode(row["value"]).decode('utf-8')
@@ -133,23 +141,23 @@ class Database:
             return None
 
     def set_system_flag(self, key: str, value: str):
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO system_flags (key, value) VALUES (?, ?)", 
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO system_flags (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", 
                 (key, value)
             )
 
     def get_system_flag(self, key: str) -> Optional[str]:
-        with self._conn() as conn:
-            row = conn.execute("SELECT value FROM system_flags WHERE key = ?", (key,)).fetchone()
+        with self._cursor() as cur:
+            cur.execute("SELECT value FROM system_flags WHERE key = %s", (key,))
+            row = cur.fetchone()
             return row["value"] if row else None
 
-    # ── Normal DB Operations ────────
     def insert_trade(self, trade: Trade):
         trailing_extreme = trade.trailing_extreme_price if trade.trailing_extreme_price != 0.0 else trade.entry_price
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO trades VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     trade.id, 
                     trade.timestamp_open.isoformat(), 
@@ -173,34 +181,31 @@ class Database:
     def update_trade(self, trade_id: str, **kwargs):
         if not kwargs:
             return
-        set_parts =[f"{k} = ?" for k in kwargs.keys()]
+        set_parts = [f"{k} = %s" for k in kwargs.keys()]
         values = list(kwargs.values()) + [trade_id]
-        with self._conn() as conn:
-            conn.execute(f"UPDATE trades SET {', '.join(set_parts)} WHERE id = ?", values)
+        with self._cursor() as cur:
+            cur.execute(f"UPDATE trades SET {', '.join(set_parts)} WHERE id = %s", values)
 
     def get_trades(self, days_back: int = 30) -> List[dict]:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM trades WHERE timestamp_open > ? ORDER BY timestamp_open DESC", 
-                (cutoff,)
-            ).fetchall()
-            return [dict(r) for r in rows]
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM trades WHERE timestamp_open > %s ORDER BY timestamp_open DESC", (cutoff,))
+            return [dict(r) for r in cur.fetchall()]
 
     def get_open_trades(self) -> List[dict]:
-        with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY timestamp_open ASC").fetchall()
-            return[dict(r) for r in rows]
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY timestamp_open ASC")
+            return [dict(r) for r in cur.fetchall()]
 
     def get_pending_trades(self) -> List[dict]:
-        with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM trades WHERE status = 'PENDING' ORDER BY timestamp_open ASC").fetchall()
-            return[dict(r) for r in rows]
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM trades WHERE status = 'PENDING' ORDER BY timestamp_open ASC")
+            return[dict(r) for r in cur.fetchall()]
 
     def get_active_trades(self) -> List[dict]:
-        with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') ORDER BY timestamp_open ASC").fetchall()
-            return[dict(r) for r in rows]
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM trades WHERE status IN ('OPEN', 'PENDING') ORDER BY timestamp_open ASC")
+            return[dict(r) for r in cur.fetchall()]
 
     def get_trade_stats(self, days_back: int = 7) -> Dict:
         trades = self.get_trades(days_back)
@@ -217,24 +222,25 @@ class Database:
         }
 
     def add_monologue(self, entry: MonologueEntry):
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO monologue (timestamp, agent, message, severity) VALUES (?,?,?,?)",
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO monologue (timestamp, agent, message, severity) VALUES (%s,%s,%s,%s)",
                 (entry.timestamp.isoformat(), entry.agent, entry.message, entry.severity)
             )
 
     def get_monologue(self, limit: int = 50) -> List[dict]:
-        with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM monologue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-            return[dict(r) for r in reversed(rows)]
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM monologue ORDER BY id DESC LIMIT %s", (limit,))
+            rows = cur.fetchall()
+            return [dict(r) for r in reversed(rows)]
 
     def add_scholar_review(self, insight: ScholarInsight):
-        with self._conn() as conn:
-            conn.execute(
+        with self._cursor() as cur:
+            cur.execute(
                 """INSERT INTO scholar_reviews 
                 (timestamp, period_start, period_end, total_trades, win_rate, total_pnl, 
                 lessons, parameter_changes, market_regime, reasoning) 
-                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (
                     insight.timestamp.isoformat(), 
                     insight.period_start.isoformat(), 
@@ -250,16 +256,16 @@ class Database:
             )
 
     def get_scholar_reviews(self, limit: int = 10) -> List[dict]:
-        with self._conn() as conn:
-            rows = conn.execute("SELECT * FROM scholar_reviews ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-            return [dict(r) for r in rows]
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM scholar_reviews ORDER BY id DESC LIMIT %s", (limit,))
+            return[dict(r) for r in cur.fetchall()]
 
     def add_pivot_event(self, event: dict):
-        with self._conn() as conn:
-            conn.execute(
+        with self._cursor() as cur:
+            cur.execute(
                 """INSERT INTO pivot_events 
                 (timestamp, old_bias, new_bias, trigger_price, broken_level, volume_ratio, reasoning) 
-                VALUES (?,?,?,?,?,?,?)""",
+                VALUES (%s,%s,%s,%s,%s,%s,%s)""",
                 (
                     event["timestamp"], event["old_bias"], event["new_bias"], 
                     event["trigger_price"], event["broken_level"], 
@@ -268,52 +274,51 @@ class Database:
             )
 
     def get_q_values(self, state_key: str) -> Optional[Dict]:
-        with self._conn() as conn:
-            row = conn.execute("SELECT action_values FROM q_table WHERE state_key = ?", (state_key,)).fetchone()
+        with self._cursor() as cur:
+            cur.execute("SELECT action_values FROM q_table WHERE state_key = %s", (state_key,))
+            row = cur.fetchone()
             if row:
                 return json.loads(row["action_values"])
             return None
 
     def upsert_q_values(self, state_key: str, action_values: Dict):
-        with self._conn() as conn:
-            conn.execute(
-                """INSERT INTO q_table (state_key, action_values) VALUES (?, ?) 
-                ON CONFLICT(state_key) DO UPDATE SET action_values = excluded.action_values""",
+        with self._cursor() as cur:
+            cur.execute(
+                """INSERT INTO q_table (state_key, action_values) VALUES (%s, %s) 
+                ON CONFLICT(state_key) DO UPDATE SET action_values = EXCLUDED.action_values""",
                 (state_key, json.dumps(action_values))
             )
 
     def save_config_snapshot(self, config_dict: Dict, changed_by: str):
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO dynamic_config_history (timestamp, config_json, changed_by) VALUES (?,?,?)",
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO dynamic_config_history (timestamp, config_json, changed_by) VALUES (%s,%s,%s)",
                 (datetime.now(timezone.utc).isoformat(), json.dumps(config_dict), changed_by)
             )
 
     def get_latest_config_snapshot(self) -> Optional[Dict]:
-        with self._conn() as conn:
-            row = conn.execute("SELECT config_json FROM dynamic_config_history ORDER BY id DESC LIMIT 1").fetchone()
+        with self._cursor() as cur:
+            cur.execute("SELECT config_json FROM dynamic_config_history ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
             if row:
                 return json.loads(row["config_json"])
             return None
 
     def reset_trades_only(self):
-        with self._conn() as conn:
-            conn.execute("DELETE FROM trades")
-            conn.execute("DELETE FROM pivot_events")
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM trades")
+            cur.execute("DELETE FROM pivot_events")
 
     def reset_all_data(self):
-        with self._conn() as conn:
-            conn.execute("DELETE FROM trades")
-            conn.execute("DELETE FROM monologue")
-            conn.execute("DELETE FROM scholar_reviews")
-            conn.execute("DELETE FROM pivot_events")
-            conn.execute("DELETE FROM q_table")
-            conn.execute("DELETE FROM dynamic_config_history")
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM trades")
+            cur.execute("DELETE FROM monologue")
+            cur.execute("DELETE FROM scholar_reviews")
+            cur.execute("DELETE FROM pivot_events")
+            cur.execute("DELETE FROM q_table")
+            cur.execute("DELETE FROM dynamic_config_history")
 
     def vacuum(self):
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        try:
-            conn.execute("VACUUM")
-            conn.commit()
-        finally:
-            conn.close()
+        # Postgres automatically vacuums in the background. 
+        # Doing it manually here isn't required and causes errors in transaction blocks.
+        pass
